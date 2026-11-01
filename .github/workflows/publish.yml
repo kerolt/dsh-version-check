@@ -1,0 +1,37 @@
+name: Publish
+
+# 推送 v* tag 时发布到 npm。认证使用 trusted publishing（OIDC），
+# 仓库里不保存 npm token；发布者配置见 README 的发布一节。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  # OIDC 换取短期发布凭据，必需
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          # 发布构建不使用依赖缓存
+          package-manager-cache: false
+      - name: 安装依赖
+        run: npm ci
+      - name: 构建、类型检查与测试
+        run: npm run verify
+      - name: 发布到 npm
+        run: npm publish

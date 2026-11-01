@@ -89,9 +89,26 @@ npm run verify  # 构建、类型检查与测试
 
 ## 发布
 
+发布由 GitHub Actions 完成，认证使用 npm trusted publishing（OIDC），仓库里不保存 npm token。
+
+- `.github/workflows/ci.yml`：推送到 `main` 与发起 pull request 时执行构建、类型检查与测试。
+- `.github/workflows/publish.yml`：推送 `v*` tag 时执行同样的检查，然后执行 `npm publish` 发布到 `latest`。
+
+发布前在 npmjs.com 打开包的 `Settings` 页面，在 `Trusted publishing` 里添加一个 GitHub Actions 发布者，这是只需要做一次的配置：
+
+- Organization or user：`kerolt`
+- Repository：`dsh-version-check`
+- Workflow filename：`publish.yml`
+- Allowed actions：勾选 `npm publish`
+
+新建的发布者配置必须在 2 天内完成第一次成功发布，否则会失效。发布时自动生成 provenance 证明，这要求 npm CLI 不低于 11.5.1；工作流使用 Node 24，自带的 npm 满足要求。
+
+发布步骤：
+
 ```sh
-npm pack   # 检查发布包内容
-npm publish
+# 修改 package.json 里的 version 并提交到 main
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 发布包只包含 `lib/`、`cordis.patch.yml`、`locale/`、`icon.svg`、`README.md` 与 `package.json`，源码与测试不进入发布包。安装到 profile 的 `node_modules` 后，DSH 从 `exports` 解析到 `lib/index.js` 与 `lib/client.js`，因此发布形态不依赖 Node 的类型剥离能力。
