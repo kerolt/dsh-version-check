@@ -93,6 +93,12 @@ interface PanelAnchor {
   bottom: number;
 }
 
+/** 版本框的固定定位锚点。 */
+interface PopoverAnchor {
+  top: number;
+  left: number;
+}
+
 /** 浏览器侧插件上下文只用到这里声明的服务。 */
 interface ClientContext {
   effect(execute: () => void | (() => void), label?: string): void;
@@ -177,11 +183,15 @@ interface ClientContext {
       'settings.loading': '正在读取设置',
       'settings.unavailable': '当前运行的 Host 版本不提供设置接口，请更新插件后重试',
       'settings.rollback.title': '回滚 DSH 版本',
-      'settings.rollback.desc': '把 DSH 主程序降级到更早的已发布版本；回滚会重启服务并中断正在进行的会话',
+      'settings.rollback.desc': '回滚会重启服务并中断正在进行的会话',
       'settings.rollback.loading': '正在读取已发布版本',
       'settings.rollback.error': '读取已发布版本失败：{message}',
       'settings.rollback.retry': '重新读取',
+      'settings.rollback.pick': '选择版本',
+      'settings.rollback.pickTitle': '选择要回滚的版本',
       'settings.rollback.empty': '没有比当前版本更旧的已发布版本',
+      'settings.rollback.expand': '显示全部 {count} 个版本',
+      'settings.rollback.collapse': '收起',
       'settings.rollback.action': '回滚',
       'settings.rollback.confirm': '回滚到 {version} 会重启 DSH 服务，正在进行的会话会中断。',
       'settings.rollback.confirmAction': '确认回滚',
@@ -241,11 +251,15 @@ interface ClientContext {
       'settings.loading': 'Loading settings',
       'settings.unavailable': 'The running Host does not expose the settings API; update the plugin and retry',
       'settings.rollback.title': 'Roll back DSH version',
-      'settings.rollback.desc': 'Downgrade the DSH main program to an earlier published version; rolling back restarts the service and interrupts running sessions',
+      'settings.rollback.desc': 'Rolling back restarts the service and interrupts running sessions',
       'settings.rollback.loading': 'Loading published versions',
       'settings.rollback.error': 'Failed to load published versions: {message}',
       'settings.rollback.retry': 'Reload',
+      'settings.rollback.pick': 'Choose a version',
+      'settings.rollback.pickTitle': 'Choose a version to roll back to',
       'settings.rollback.empty': 'No published version older than the installed one',
+      'settings.rollback.expand': 'Show all {count} versions',
+      'settings.rollback.collapse': 'Show fewer',
       'settings.rollback.action': 'Roll back',
       'settings.rollback.confirm': 'Rolling back to {version} restarts the DSH service and interrupts running sessions.',
       'settings.rollback.confirmAction': 'Confirm rollback',
@@ -867,6 +881,13 @@ interface ClientContext {
     const INTERVAL_MAX = 10080;
     const CHANNEL_OPTIONS = ['auto', 'latest', 'next', 'alpha'];
 
+    // 回滚列表默认展示的版本数量，超出的版本通过展开显示
+    const DEFAULT_VISIBLE_ROLLBACK_VERSIONS = 5;
+
+    // 回滚版本框的尺寸，定位与内容滚动都按这个尺寸计算
+    const ROLLBACK_POPOVER_WIDTH = 320;
+    const ROLLBACK_POPOVER_HEIGHT = 360;
+
     // 设置页：更新检查开关、自动检查间隔与发布渠道。
     function VersionCheckSettings({ t, store }: { t: Translate; store: VersionStore }): unknown {
       // 订阅共享状态并维护输入草稿
@@ -914,21 +935,21 @@ interface ClientContext {
         }, 2000);
       };
 
-      const save = async (patch: PreferencesPatch): Promise<void> => {
+      const save = async (patch: PreferencesPatch, silent = false): Promise<void> => {
         setSaved(false);
         await store.savePreferences(patch);
         const next = store.getView();
-        if (next.actionError === null && next.busy === null) {
+        if (!silent && next.actionError === null && next.busy === null) {
           markSaved();
         }
       };
 
-      // 三个设置项的事件处理
+      // 三个设置项的事件处理；开关状态本身可见，保存后不提示已保存
       const toggleCheck = (): void => {
         if (settings === null || controlsDisabled) {
           return;
         }
-        void save({ checkEnabled: !settings.checkEnabled });
+        void save({ checkEnabled: !settings.checkEnabled }, true);
       };
 
       const commitInterval = (): void => {
@@ -1096,16 +1117,18 @@ interface ClientContext {
         { className: 'dvc-settings' },
         h('p', { className: 'dvc-settings-blurb' }, t('settings.description')),
         rows,
-        h(
-          'p',
-          {
-            className: 'dvc-settings-feedback',
-            key: 'feedback',
-            role: 'status',
-            'data-tone': feedbackTone === undefined ? undefined : feedbackTone,
-          },
-          feedback,
-        ),
+        feedback === ''
+          ? null
+          : h(
+              'p',
+              {
+                className: 'dvc-settings-feedback',
+                key: 'feedback',
+                role: 'status',
+                'data-tone': feedbackTone === undefined ? undefined : feedbackTone,
+              },
+              feedback,
+            ),
         h(RollbackSection, { t, store, key: 'rollback' }),
       );
     }
@@ -1125,7 +1148,7 @@ interface ClientContext {
       return `${date.getFullYear()}-${month}-${day}`;
     }
 
-    // 设置页的回滚区域：列出比当前安装版本更旧的已发布版本，确认后降级。
+    // 设置页的回滚区域：点击按钮弹出候选版本框，确认后降级。
     function RollbackSection({ t, store }: { t: Translate; store: VersionStore }): unknown {
       // 订阅共享状态
       const view = React.useSyncExternalStore(store.subscribe, store.getView);
@@ -1135,19 +1158,28 @@ interface ClientContext {
       const phase = snapshot === null ? null : snapshot.phase;
       const target = snapshot === null ? null : snapshot.target;
 
-      // 候选版本、读取状态与待确认的目标
+      // 版本框开关与锚点、候选版本、待确认的目标
+      const [open, setOpen] = React.useState(false);
+      const [anchor, setAnchor] = React.useState<PopoverAnchor | null>(null);
+      const triggerRef = React.useRef<HTMLButtonElement | null>(null);
+      const popoverRef = React.useRef<HTMLElement | null>(null);
       const [status, setStatus] = React.useState<'loading' | 'ready' | 'error'>('loading');
       const [versions, setVersions] = React.useState<RollbackVersion[]>([]);
       const [loadError, setLoadError] = React.useState<string | null>(null);
       const [pending, setPending] = React.useState<string | null>(null);
       const [reloadToken, setReloadToken] = React.useState(0);
+      const [expanded, setExpanded] = React.useState(false);
 
-      // 安装版本变化后重新读取候选列表
+      // 打开版本框时读取候选列表
       React.useEffect(() => {
+        if (!open) {
+          return;
+        }
         let cancelled = false;
         setStatus('loading');
         setLoadError(null);
         setPending(null);
+        setExpanded(false);
         void (async () => {
           try {
             const response = await fetch(VERSIONS_PATH, {
@@ -1183,7 +1215,69 @@ interface ClientContext {
         return () => {
           cancelled = true;
         };
-      }, [bootVersion, installedVersion, reloadToken]);
+      }, [open, reloadToken]);
+
+      // 版本框贴住触发按钮，页面滚动或窗口尺寸变化时重新定位
+      React.useLayoutEffect(() => {
+        if (!open) {
+          return;
+        }
+        const place = (): void => {
+          const trigger = triggerRef.current;
+          if (trigger === null) {
+            return;
+          }
+          const rect = trigger.getBoundingClientRect();
+          const left = Math.max(
+            8,
+            Math.min(rect.right - ROLLBACK_POPOVER_WIDTH, window.innerWidth - ROLLBACK_POPOVER_WIDTH - 8),
+          );
+          const below = rect.bottom + 6;
+          const top =
+            below + ROLLBACK_POPOVER_HEIGHT <= window.innerHeight - 8
+              ? below
+              : Math.max(8, rect.top - ROLLBACK_POPOVER_HEIGHT - 6);
+          setAnchor({ top, left });
+        };
+        place();
+        window.addEventListener('resize', place);
+        document.addEventListener('scroll', place, true);
+        return () => {
+          window.removeEventListener('resize', place);
+          document.removeEventListener('scroll', place, true);
+        };
+      }, [open]);
+
+      // 点击版本框外部或按 Escape 关闭
+      React.useEffect(() => {
+        if (!open) {
+          return;
+        }
+        const onPointerDown = (event: PointerEvent): void => {
+          const targetNode = event.target as Node | null;
+          if (targetNode === null) {
+            return;
+          }
+          if (popoverRef.current !== null && popoverRef.current.contains(targetNode)) {
+            return;
+          }
+          if (triggerRef.current !== null && triggerRef.current.contains(targetNode)) {
+            return;
+          }
+          setOpen(false);
+        };
+        const onKeyDown = (event: KeyboardEvent): void => {
+          if (event.key === 'Escape') {
+            setOpen(false);
+          }
+        };
+        document.addEventListener('pointerdown', onPointerDown);
+        document.addEventListener('keydown', onKeyDown);
+        return () => {
+          document.removeEventListener('pointerdown', onPointerDown);
+          document.removeEventListener('keydown', onKeyDown);
+        };
+      }, [open]);
 
       // 安装或重启期间禁止再次触发
       const busy = view.busy !== null || phase === 'installing' || phase === 'restarting';
@@ -1200,19 +1294,22 @@ interface ClientContext {
         });
       }
 
-      // 候选列表
-      const listRows: unknown[] = [];
+      // 默认只渲染最近的一批版本，展开后渲染全部
+      const visibleVersions = expanded ? versions : versions.slice(0, DEFAULT_VISIBLE_ROLLBACK_VERSIONS);
+
+      // 版本框内容：读取状态、候选列表或回滚确认
+      const content: unknown[] = [];
       if (status === 'loading') {
-        listRows.push(h('p', { className: 'dvc-settings-feedback', key: 'loading' }, t('settings.rollback.loading')));
+        content.push(h('p', { className: 'dvc-settings-feedback', key: 'loading' }, t('settings.rollback.loading')));
       } else if (status === 'error') {
-        listRows.push(
+        content.push(
           h(
             'p',
             { className: 'dvc-settings-feedback', key: 'load-error', role: 'alert', 'data-tone': 'error' },
             t('settings.rollback.error', { message: loadError === null ? '' : loadError }),
           ),
         );
-        listRows.push(
+        content.push(
           h(
             'button',
             {
@@ -1228,13 +1325,54 @@ interface ClientContext {
           ),
         );
       } else if (versions.length === 0) {
-        listRows.push(h('p', { className: 'dvc-settings-feedback', key: 'empty' }, t('settings.rollback.empty')));
+        content.push(h('p', { className: 'dvc-settings-feedback', key: 'empty' }, t('settings.rollback.empty')));
+      } else if (pending !== null) {
+        content.push(
+          h(
+            'p',
+            { className: 'dvc-rollback-confirmText', key: 'confirm-text' },
+            t('settings.rollback.confirm', { version: pending }),
+          ),
+        );
+        content.push(
+          h(
+            'div',
+            { className: 'dvc-rollback-confirmActions', key: 'confirm-actions' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dvc-button',
+                onClick: () => {
+                  setPending(null);
+                },
+              },
+              t('settings.rollback.cancel'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dvc-button',
+                'data-primary': true,
+                disabled: busy,
+                onClick: () => {
+                  const version = pending;
+                  setPending(null);
+                  setOpen(false);
+                  void store.rollbackTo(version);
+                },
+              },
+              t('settings.rollback.confirmAction'),
+            ),
+          ),
+        );
       } else {
-        listRows.push(
+        content.push(
           h(
             'div',
             { className: 'dvc-rollback-list', key: 'list' },
-            versions.map((entry) =>
+            visibleVersions.map((entry) =>
               h(
                 'div',
                 { className: 'dvc-rollback-row', key: entry.version },
@@ -1245,7 +1383,7 @@ interface ClientContext {
                   {
                     type: 'button',
                     className: 'dvc-button',
-                    disabled: busy || pending !== null,
+                    disabled: busy,
                     onClick: () => {
                       setPending(entry.version);
                     },
@@ -1258,52 +1396,30 @@ interface ClientContext {
         );
       }
 
-      // 确认条：回滚会重启服务，先确认再执行
-      const confirmBar =
-        pending === null
-          ? null
-          : h(
-              'div',
-              { className: 'dvc-rollback-confirm', key: 'confirm' },
-              h('span', { className: 'dvc-rollback-confirmText' }, t('settings.rollback.confirm', { version: pending })),
-              h(
-                'div',
-                { className: 'dvc-rollback-confirmActions' },
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'dvc-button',
-                    onClick: () => {
-                      setPending(null);
-                    },
-                  },
-                  t('settings.rollback.cancel'),
-                ),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'dvc-button',
-                    'data-primary': true,
-                    disabled: busy,
-                    onClick: () => {
-                      const version = pending;
-                      setPending(null);
-                      void store.rollbackTo(version);
-                    },
-                  },
-                  t('settings.rollback.confirmAction'),
-                ),
-              ),
-            );
+      // 展开更多版本，展开后的列表在版本框内滚动
+      const toggle =
+        status === 'ready' && pending === null && versions.length > DEFAULT_VISIBLE_ROLLBACK_VERSIONS
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'dvc-button dvc-rollback-toggle',
+                key: 'toggle',
+                disabled: busy,
+                onClick: () => {
+                  setExpanded((value) => !value);
+                },
+              },
+              expanded
+                ? t('settings.rollback.collapse')
+                : t('settings.rollback.expand', { count: versions.length }),
+            )
+          : null;
 
       // 状态与错误提示
       const notices: unknown[] = [];
       if (actionError !== null) {
-        notices.push(
-          h('p', { className: 'dvc-error', key: 'action-error', role: 'alert' }, actionError),
-        );
+        notices.push(h('p', { className: 'dvc-error', key: 'action-error', role: 'alert' }, actionError));
       } else if (hostError !== null && phase === 'error') {
         notices.push(h('p', { className: 'dvc-error', key: 'host-error', role: 'alert' }, hostError));
       }
@@ -1311,14 +1427,59 @@ interface ClientContext {
         notices.push(h('p', { className: 'dvc-note', key: 'progress' }, progressText));
       }
 
+      // 版本框
+      const popover =
+        open && anchor !== null
+          ? h(
+              'section',
+              {
+                key: 'popover',
+                className: 'dvc-rollback-popover',
+                style: anchor,
+                role: 'dialog',
+                'aria-label': t('settings.rollback.pickTitle'),
+                ref: popoverRef,
+              },
+              h(
+                'header',
+                { className: 'dvc-rollback-popoverHeader' },
+                h('span', { className: 'dvc-rollback-popoverTitle' }, t('settings.rollback.pickTitle')),
+              ),
+              h('div', { className: 'dvc-rollback-popoverBody' }, content),
+              toggle === null ? null : h('div', { className: 'dvc-rollback-popoverFooter' }, toggle),
+            )
+          : null;
+
       return h(
         'div',
         { className: 'dvc-settings-section' },
-        h('p', { className: 'dvc-settings-sectionTitle' }, t('settings.rollback.title')),
+        h(
+          'div',
+          { className: 'dvc-rollback-header' },
+          h('span', { className: 'dvc-settings-rowTitle' }, t('settings.rollback.title')),
+          h(
+            'div',
+            { className: 'dvc-rollback-picker' },
+            h(
+              'button',
+              {
+                ref: triggerRef,
+                type: 'button',
+                className: 'dvc-button dvc-rollback-pick',
+                'aria-haspopup': 'dialog',
+                'aria-expanded': open,
+                disabled: busy,
+                onClick: () => {
+                  setOpen((value) => !value);
+                },
+              },
+              t('settings.rollback.pick'),
+            ),
+            popover,
+          ),
+        ),
         h('p', { className: 'dvc-settings-rowDesc' }, t('settings.rollback.desc')),
         notices,
-        confirmBar,
-        listRows,
         h('p', { className: 'dvc-note' }, t('panel.note.registry')),
       );
     }
