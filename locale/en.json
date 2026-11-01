@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "DSH Version Check",
-    "description": "Shows the installed DSH version at the sidebar foot, checks npm for a newer release, and updates it with one click while restarting the service."
+    "description": "Shows the installed DSH version at the sidebar foot, checks npm for a newer release, updates it or rolls the main program back to an earlier release with one click while restarting the service."
   }
 }

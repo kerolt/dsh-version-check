@@ -1,6 +1,6 @@
 # dsh-version-check
 
-一个只管理 DSH 自身版本的 DSH 插件：在 Web 侧边栏底部的用户头像名称上方显示当前 DSH 版本，从 npm registry 检查 `@deepseek-ai/dsh` 的新版本，发现新版本后可以一键安装并自动重启 DSH 服务。它不检查其他插件，也不修改 profile 里已安装插件。
+一个只管理 DSH 自身版本的 DSH 插件：在 Web 侧边栏底部的用户头像名称上方显示当前 DSH 版本，从 npm registry 检查 `@deepseek-ai/dsh` 的新版本，发现新版本后可以一键安装并自动重启 DSH 服务；也可以在设置页把主程序降级到更早的已发布版本。它不检查其他插件，也不修改 profile 里已安装插件。
 
 ## 界面
 
@@ -15,15 +15,17 @@
 - `检查更新` 开关：关闭后停止定时检查，也不提供「更新并重启」；弹层里的「检查更新」仍然可以手动查询最新版本，但结果只用于展示。
 - `自动检查间隔`：两次自动检查之间的分钟数，范围 1 到 10080。
 - `发布渠道`：`自动` 跟随当前安装版本的前置标识（rc 版本跟踪 `latest`，alpha 版本跟踪 `alpha`），也可以固定为 `latest`、`next`、`alpha` 等 dist-tag。
+- `回滚 DSH 版本`：列出 registry 上比当前安装版本更旧的已发布版本与发布时间，选中后确认即可降级；回滚会重启服务并中断正在进行的会话。
 
-这些选择保存在 `~/.dsh/dsh-version-check/preferences.json`，修改后立即生效，不需要重启 DSH。
+这些选择保存在 `~/.dsh/dsh-version-check/preferences.json`，修改后立即生效，不需要重启 DSH。回滚候选列表不需要保存，每次打开设置页时按需读取 registry 并在内存里缓存 5 分钟。
 
 ## 行为
 
 - 检查开启时，插件加载后 5 秒执行一次定时检查，之后按设置的间隔检查；点击侧边栏或打开弹层都只读取状态，不会触发检查。手动检查仅由弹层里的「检查更新」按钮发起。
-- 安装使用 `npm install -g @deepseek-ai/dsh@<版本> --prefix <检测到的 npm 全局前缀>`，安装完成后回读磁盘上的 `package.json` 校验版本。
+- 安装使用 `npm install -g @deepseek-ai/dsh@<版本> --prefix <检测到的 npm 全局前缀>`，安装完成后回读磁盘上的 `package.json` 校验版本。更新与回滚共用这条安装流程。
+- 回滚目标会先与 registry 的版本列表核对：只有比当前安装版本更旧的已发布版本才会被接受，安装完成后同样回读校验并重启服务。回滚是修复操作，不受「检查更新」开关限制。
 - 重启通过 systemd 用户服务进行：从进程 cgroup 中识别当前服务单元（例如 `dsh-web.service`），确认当前进程就是该服务主进程后，调用 `systemctl --user restart --no-block <单元>`。检测不到 systemd 服务时不会终止进程，面板改为提示手动重启。
-- 更新会终止正在进行中的会话，面板里有明确提示。
+- 更新与回滚都会终止正在进行中的会话，界面上有明确提示。
 
 ## 配置
 
@@ -47,7 +49,7 @@
 
 ## 安全边界
 
-写操作路由（check、update、restart、preferences）只接受同源页面发起的请求：连接来源必须是本机 loopback，`Host` 必须是 loopback 或 `allowedOrigins` 中的主机名，`Origin` 必须与 `Host` 一致；POST 请求还要求 `content-type: application/json`，更新与重启还要求 `confirm: true`。这防止其他网页通过 DNS rebinding 或表单请求触发安装或修改设置。
+写操作路由（check、update、rollback、restart、preferences）只接受同源页面发起的请求：连接来源必须是本机 loopback，`Host` 必须是 loopback 或 `allowedOrigins` 中的主机名，`Origin` 必须与 `Host` 一致；POST 请求还要求 `content-type: application/json`，更新、回滚与重启还要求 `confirm: true`。版本列表路由 versions 只接受 GET，同样校验连接来源与 `Host`。这防止其他网页通过 DNS rebinding 或表单请求触发安装、降级或修改设置。
 
 ## 安装
 
@@ -61,9 +63,9 @@ dsh plugin --profile web add dsh-version-check
 
 源码在 `src/`，`lib/` 是构建产物，发布包只包含 `lib/` 与资源文件：
 
-- `src/index.ts`：Host 入口，注册五个 HTTP 路由、把 `styles/client.css` 注入页面 head、自动检查与设置持久化。
+- `src/index.ts`：Host 入口，注册七个 HTTP 路由、把 `styles/client.css` 注入页面 head、自动检查与设置持久化。
 - `src/versions.ts`：版本解析与 semver 优先级比较。
-- `src/registry.ts`：读取 npm dist-tags，选择跟踪的渠道。
+- `src/registry.ts`：读取 npm dist-tags 与已发布版本列表，选择跟踪的渠道并筛选回滚候选。
 - `src/deployment.ts`：定位 DSH 安装目录、npm 全局前缀与 systemd 单元。
 - `src/gate.ts`：请求来源校验。
 - `src/install.ts`：npm 安装子进程与服务重启。

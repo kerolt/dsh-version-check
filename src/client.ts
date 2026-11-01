@@ -39,7 +39,7 @@ interface Snapshot {
 }
 
 /** 进行中的动作名称。 */
-type BusyAction = 'check' | 'update' | 'restart' | 'preferences';
+type BusyAction = 'check' | 'update' | 'rollback' | 'restart' | 'preferences';
 
 /** 设置补丁。 */
 interface PreferencesPatch {
@@ -54,7 +54,21 @@ interface VersionView {
   offline: boolean;
   actionError: string | null;
   busy: BusyAction | null;
+  lastAction: BusyAction | null;
   pendingTarget: string | null;
+}
+
+/** registry 里的一个已发布版本。 */
+interface RollbackVersion {
+  version: string;
+  publishedAt: string | null;
+}
+
+/** GET /versions 的响应。 */
+interface VersionsResponse {
+  ok: true;
+  installedVersion: string;
+  versions: RollbackVersion[];
 }
 
 /** 翻译函数。 */
@@ -68,6 +82,7 @@ interface VersionStore {
   stop(): void;
   checkNow(): Promise<void>;
   startUpdate(version: string): Promise<void>;
+  rollbackTo(version: string): Promise<void>;
   restartService(): Promise<void>;
   savePreferences(patch: PreferencesPatch): Promise<void>;
 }
@@ -102,6 +117,8 @@ interface ClientContext {
     const STATE_PATH = '/__dsh-version-check/state';
     const CHECK_PATH = '/__dsh-version-check/check';
     const UPDATE_PATH = '/__dsh-version-check/update';
+    const VERSIONS_PATH = '/__dsh-version-check/versions';
+    const ROLLBACK_PATH = '/__dsh-version-check/rollback';
     const RESTART_PATH = '/__dsh-version-check/restart';
     const PREFERENCES_PATH = '/__dsh-version-check/preferences';
     const IDLE_POLL_MS = 30000;
@@ -145,7 +162,7 @@ interface ClientContext {
       'panel.note.autoOff': '自动检查已关闭，仍可手动检查最新版本；重新开启后才能更新',
       'panel.note.registry': '来源 npm registry',
       'settings.nav': '版本更新',
-      'settings.description': '控制 DSH 自身更新检查的开关、自动检查间隔与发布渠道',
+      'settings.description': '控制 DSH 自身更新检查的开关、自动检查间隔与发布渠道，也可以把主程序回滚到更早的已发布版本',
       'settings.check.title': '检查更新',
       'settings.check.desc': '关闭后不再定时检查，也不启用更新功能；仍可在弹层里手动检查最新版本',
       'settings.interval.title': '自动检查间隔',
@@ -159,6 +176,19 @@ interface ClientContext {
       'settings.save.saved': '已保存',
       'settings.loading': '正在读取设置',
       'settings.unavailable': '当前运行的 Host 版本不提供设置接口，请更新插件后重试',
+      'settings.rollback.title': '回滚 DSH 版本',
+      'settings.rollback.desc': '把 DSH 主程序降级到更早的已发布版本；回滚会重启服务并中断正在进行的会话',
+      'settings.rollback.loading': '正在读取已发布版本',
+      'settings.rollback.error': '读取已发布版本失败：{message}',
+      'settings.rollback.retry': '重新读取',
+      'settings.rollback.empty': '没有比当前版本更旧的已发布版本',
+      'settings.rollback.action': '回滚',
+      'settings.rollback.confirm': '回滚到 {version} 会重启 DSH 服务，正在进行的会话会中断。',
+      'settings.rollback.confirmAction': '确认回滚',
+      'settings.rollback.cancel': '取消',
+      'settings.rollback.installing': '正在安装 {version}',
+      'settings.rollback.restarting': '正在重启服务',
+      'settings.rollback.restartRequired': '已安装 {version}，需要手动重启 dsh 服务才能生效',
     };
 
     const en = {
@@ -196,7 +226,7 @@ interface ClientContext {
       'panel.note.autoOff': 'Automatic checking is off; you can still check manually, but updating requires re-enabling it',
       'panel.note.registry': 'Source: npm registry',
       'settings.nav': 'Version updates',
-      'settings.description': 'Control DSH update checking, its automatic interval, and the release channel',
+      'settings.description': 'Control DSH update checking, its automatic interval, and the release channel; you can also roll the main program back to an earlier published version',
       'settings.check.title': 'Check for updates',
       'settings.check.desc': 'When off, no scheduled checks and no updates; you can still check manually from the popover',
       'settings.interval.title': 'Auto-check interval',
@@ -210,6 +240,19 @@ interface ClientContext {
       'settings.save.saved': 'Saved',
       'settings.loading': 'Loading settings',
       'settings.unavailable': 'The running Host does not expose the settings API; update the plugin and retry',
+      'settings.rollback.title': 'Roll back DSH version',
+      'settings.rollback.desc': 'Downgrade the DSH main program to an earlier published version; rolling back restarts the service and interrupts running sessions',
+      'settings.rollback.loading': 'Loading published versions',
+      'settings.rollback.error': 'Failed to load published versions: {message}',
+      'settings.rollback.retry': 'Reload',
+      'settings.rollback.empty': 'No published version older than the installed one',
+      'settings.rollback.action': 'Roll back',
+      'settings.rollback.confirm': 'Rolling back to {version} restarts the DSH service and interrupts running sessions.',
+      'settings.rollback.confirmAction': 'Confirm rollback',
+      'settings.rollback.cancel': 'Cancel',
+      'settings.rollback.installing': 'Installing {version}',
+      'settings.rollback.restarting': 'Restarting service',
+      'settings.rollback.restartRequired': 'Installed {version}; restart dsh manually to apply',
     };
 
     function describeError(failure: unknown): string {
@@ -224,7 +267,8 @@ interface ClientContext {
         snapshot: null, // 最近一次 GET /state 的 JSON
         offline: false, // 最近一次请求是否失败过
         actionError: null, // 动作失败时的可读文案
-        busy: null, // 进行中的动作：check / update / restart / preferences
+        busy: null, // 进行中的动作：check / update / rollback / restart / preferences
+        lastAction: null, // 最近一次发起或结束的动作，用于把错误归到对应界面
         pendingTarget: null, // 用户点击更新时记录的目标版本
       });
       let timer: ReturnType<typeof setTimeout> | null = null;
@@ -351,11 +395,12 @@ interface ClientContext {
       };
 
       // 执行动作并统一收尾：成功时刷新快照，失败时记录文案
+      // 执行动作并统一收尾：成功时刷新快照，失败时记录文案
       const runAction = async (action: BusyAction, task: () => Promise<Snapshot>): Promise<void> => {
         if (view.busy !== null) {
           return;
         }
-        publish({ busy: action, actionError: null });
+        publish({ busy: action, lastAction: action, actionError: null });
         try {
           const snapshot = await task();
           publish({ snapshot, offline: false, busy: null, actionError: null });
@@ -380,13 +425,27 @@ interface ClientContext {
         return runAction('update', () => sendAction(UPDATE_PATH, { confirm: true, version }));
       };
 
+      // 回滚与更新共用同一个 Host 安装状态机，只是目标版本更旧
+      const rollbackTo = (version: string): Promise<void> =>
+        runAction('rollback', () => sendAction(ROLLBACK_PATH, { confirm: true, version }));
+
       const restartService = (): Promise<void> =>
         runAction('restart', () => sendAction(RESTART_PATH, { confirm: true }));
 
       const savePreferences = (patch: PreferencesPatch): Promise<void> =>
         runAction('preferences', () => sendAction(PREFERENCES_PATH, patch));
 
-      return { subscribe, getView, start, stop, checkNow, startUpdate, restartService, savePreferences };
+      return {
+        subscribe,
+        getView,
+        start,
+        stop,
+        checkNow,
+        startUpdate,
+        rollbackTo,
+        restartService,
+        savePreferences,
+      };
     }
 
     // 内联 SVG 图标：圆形箭头。线条颜色继承文字颜色。
@@ -464,9 +523,15 @@ interface ClientContext {
       const hostError = snapshot === null || snapshot.lastError === null ? null : snapshot.lastError.message;
       const checkEnabled = snapshot === null || snapshot.settings === undefined ? true : snapshot.settings.checkEnabled !== false;
       const paused = snapshot !== null && !checkEnabled;
-      const errorText =
-        view.actionError !== null
+      // 弹层只显示本弹层发起的动作错误；设置页保存与回滚的错误归各自界面
+      const actionError =
+        view.actionError !== null &&
+        (view.lastAction === 'check' || view.lastAction === 'update' || view.lastAction === 'restart')
           ? view.actionError
+          : null;
+      const errorText =
+        actionError !== null
+          ? actionError
           : hostError !== null
             ? hostError
             : snapshot === null && view.offline
@@ -893,7 +958,7 @@ interface ClientContext {
       // 保存反馈文案
       let feedback = '';
       let feedbackTone: string | undefined;
-      if (view.actionError !== null) {
+      if (view.actionError !== null && view.lastAction === 'preferences') {
         feedback = view.actionError;
         feedbackTone = 'error';
       } else if (busy) {
@@ -1041,6 +1106,220 @@ interface ClientContext {
           },
           feedback,
         ),
+        h(RollbackSection, { t, store, key: 'rollback' }),
+      );
+    }
+
+    /** 把 ISO 时间格式化为本地年月日。 */
+    function formatPublishDate(value: string | null): string {
+      if (value === null) {
+        return '';
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return '';
+      }
+
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${date.getFullYear()}-${month}-${day}`;
+    }
+
+    // 设置页的回滚区域：列出比当前安装版本更旧的已发布版本，确认后降级。
+    function RollbackSection({ t, store }: { t: Translate; store: VersionStore }): unknown {
+      // 订阅共享状态
+      const view = React.useSyncExternalStore(store.subscribe, store.getView);
+      const snapshot = view.snapshot;
+      const bootVersion = snapshot === null ? null : snapshot.bootVersion;
+      const installedVersion = snapshot === null ? null : snapshot.installedVersion;
+      const phase = snapshot === null ? null : snapshot.phase;
+      const target = snapshot === null ? null : snapshot.target;
+
+      // 候选版本、读取状态与待确认的目标
+      const [status, setStatus] = React.useState<'loading' | 'ready' | 'error'>('loading');
+      const [versions, setVersions] = React.useState<RollbackVersion[]>([]);
+      const [loadError, setLoadError] = React.useState<string | null>(null);
+      const [pending, setPending] = React.useState<string | null>(null);
+      const [reloadToken, setReloadToken] = React.useState(0);
+
+      // 安装版本变化后重新读取候选列表
+      React.useEffect(() => {
+        let cancelled = false;
+        setStatus('loading');
+        setLoadError(null);
+        setPending(null);
+        void (async () => {
+          try {
+            const response = await fetch(VERSIONS_PATH, {
+              method: 'GET',
+              headers: { accept: 'application/json' },
+              cache: 'no-store',
+            });
+            const text = await response.text();
+            const payload: unknown = text === '' ? null : JSON.parse(text);
+            if (!response.ok) {
+              const failure = payload as { error?: { message?: string } } | null;
+              const message =
+                failure !== null && failure.error !== undefined && failure.error !== null
+                  ? (failure.error.message as string)
+                  : `GET ${VERSIONS_PATH} 返回 HTTP ${response.status}`;
+              throw new Error(message);
+            }
+            if (cancelled) {
+              return;
+            }
+            const parsed = payload as VersionsResponse;
+            setVersions(Array.isArray(parsed.versions) ? parsed.versions : []);
+            setStatus('ready');
+          } catch (failure) {
+            if (cancelled) {
+              return;
+            }
+            setLoadError(describeError(failure));
+            setStatus('error');
+          }
+        })();
+
+        return () => {
+          cancelled = true;
+        };
+      }, [bootVersion, installedVersion, reloadToken]);
+
+      // 安装或重启期间禁止再次触发
+      const busy = view.busy !== null || phase === 'installing' || phase === 'restarting';
+      const hostError = snapshot === null || snapshot.lastError === null ? null : snapshot.lastError.message;
+      const actionError = view.actionError !== null && view.lastAction === 'rollback' ? view.actionError : null;
+      let progressText: string | null = null;
+      if (phase === 'installing') {
+        progressText = t('settings.rollback.installing', { version: target === null ? '' : target });
+      } else if (phase === 'restarting') {
+        progressText = t('settings.rollback.restarting');
+      } else if (phase === 'restart-required' && installedVersion !== bootVersion) {
+        progressText = t('settings.rollback.restartRequired', {
+          version: installedVersion === null ? '' : installedVersion,
+        });
+      }
+
+      // 候选列表
+      const listRows: unknown[] = [];
+      if (status === 'loading') {
+        listRows.push(h('p', { className: 'dvc-settings-feedback', key: 'loading' }, t('settings.rollback.loading')));
+      } else if (status === 'error') {
+        listRows.push(
+          h(
+            'p',
+            { className: 'dvc-settings-feedback', key: 'load-error', role: 'alert', 'data-tone': 'error' },
+            t('settings.rollback.error', { message: loadError === null ? '' : loadError }),
+          ),
+        );
+        listRows.push(
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dvc-button',
+              key: 'retry',
+              disabled: busy,
+              onClick: () => {
+                setReloadToken((value) => value + 1);
+              },
+            },
+            t('settings.rollback.retry'),
+          ),
+        );
+      } else if (versions.length === 0) {
+        listRows.push(h('p', { className: 'dvc-settings-feedback', key: 'empty' }, t('settings.rollback.empty')));
+      } else {
+        listRows.push(
+          h(
+            'div',
+            { className: 'dvc-rollback-list', key: 'list' },
+            versions.map((entry) =>
+              h(
+                'div',
+                { className: 'dvc-rollback-row', key: entry.version },
+                h('span', { className: 'dvc-rollback-version' }, entry.version),
+                h('span', { className: 'dvc-rollback-date' }, formatPublishDate(entry.publishedAt)),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dvc-button',
+                    disabled: busy || pending !== null,
+                    onClick: () => {
+                      setPending(entry.version);
+                    },
+                  },
+                  t('settings.rollback.action'),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+
+      // 确认条：回滚会重启服务，先确认再执行
+      const confirmBar =
+        pending === null
+          ? null
+          : h(
+              'div',
+              { className: 'dvc-rollback-confirm', key: 'confirm' },
+              h('span', { className: 'dvc-rollback-confirmText' }, t('settings.rollback.confirm', { version: pending })),
+              h(
+                'div',
+                { className: 'dvc-rollback-confirmActions' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dvc-button',
+                    onClick: () => {
+                      setPending(null);
+                    },
+                  },
+                  t('settings.rollback.cancel'),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dvc-button',
+                    'data-primary': true,
+                    disabled: busy,
+                    onClick: () => {
+                      const version = pending;
+                      setPending(null);
+                      void store.rollbackTo(version);
+                    },
+                  },
+                  t('settings.rollback.confirmAction'),
+                ),
+              ),
+            );
+
+      // 状态与错误提示
+      const notices: unknown[] = [];
+      if (actionError !== null) {
+        notices.push(
+          h('p', { className: 'dvc-error', key: 'action-error', role: 'alert' }, actionError),
+        );
+      } else if (hostError !== null && phase === 'error') {
+        notices.push(h('p', { className: 'dvc-error', key: 'host-error', role: 'alert' }, hostError));
+      }
+      if (progressText !== null) {
+        notices.push(h('p', { className: 'dvc-note', key: 'progress' }, progressText));
+      }
+
+      return h(
+        'div',
+        { className: 'dvc-settings-section' },
+        h('p', { className: 'dvc-settings-sectionTitle' }, t('settings.rollback.title')),
+        h('p', { className: 'dvc-settings-rowDesc' }, t('settings.rollback.desc')),
+        notices,
+        confirmBar,
+        listRows,
+        h('p', { className: 'dvc-note' }, t('panel.note.registry')),
       );
     }
 

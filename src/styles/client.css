@@ -58,3 +58,14 @@
 .dvc-settings-unit{color:var(--dsw-alias-label-tertiary);font-size:12px}
 .dvc-settings-feedback{min-height:18px;margin:8px 0 0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .dvc-settings-feedback[data-tone="error"]{color:var(--dsw-alias-state-error-primary)}
+.dvc-settings-section{display:flex;flex-direction:column;gap:8px;padding-top:16px;border-top:.5px solid var(--dsw-alias-border-l2)}
+.dvc-settings-sectionTitle{margin:0;color:var(--dsw-alias-label-primary);font-size:14px;line-height:20px}
+.dvc-settings-section .dvc-settings-rowDesc{margin:0}
+.dvc-rollback-list{display:flex;flex-direction:column;gap:4px;max-height:320px;overflow-y:auto;padding-right:4px}
+.dvc-rollback-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.dvc-rollback-version{flex:none;color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-code,monospace);font-size:13px}
+.dvc-rollback-date{flex:1;min-width:0;color:var(--dsw-alias-label-tertiary);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dvc-rollback-row .dvc-button{height:28px;padding:0 10px;font-size:12px}
+.dvc-rollback-confirm{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-radius:8px;background:var(--dsw-alias-interactive-bg-hover)}
+.dvc-rollback-confirmText{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
+.dvc-rollback-confirmActions{display:flex;flex:none;gap:8px}

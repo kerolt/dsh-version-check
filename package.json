@@ -1,7 +1,7 @@
 {
   "name": "dsh-version-check",
-  "version": "0.2.1",
-  "description": "在 DSH Web 侧边栏底部显示 DSH 版本，从 npm 检查新版本，并支持一键更新与自动重启服务；更新检查可在设置页里开关与调整。",
+  "version": "0.3.0",
+  "description": "在 DSH Web 侧边栏底部显示 DSH 版本，从 npm 检查新版本，支持一键更新、把主程序回滚到更早的已发布版本，并在更新与回滚后自动重启服务；更新检查可在设置页里开关与调整。",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",

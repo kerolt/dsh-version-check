@@ -1,7 +1,7 @@
 /**
  * dsh-version-check Host 半。
- * 注册五个 loopback 路由：读取状态、检查更新、执行更新、重启服务、保存设置；
- * 并把 styles/client.css 注入页面 head，供浏览器半使用。
+ * 注册七个 loopback 路由：读取状态、检查更新、执行更新、列出可回滚版本、执行回滚、
+ * 重启服务、保存设置；并把 styles/client.css 注入页面 head，供浏览器半使用。
  */
 
 import { readFileSync } from 'node:fs';
@@ -22,12 +22,21 @@ import {
   writePreferencesFile,
   type Preferences,
 } from './preferences.js';
-import { fetchDistTags, pickTarget, type DistTags } from './registry.js';
+import {
+  fetchDistTags,
+  fetchPublishedVersions,
+  pickTarget,
+  selectRollbackCandidates,
+  type DistTags,
+  type PublishedVersion,
+} from './registry.js';
 import { compareVersions, isValidVersion } from './versions.js';
 
 const STATE_PATH = '/__dsh-version-check/state';
 const CHECK_PATH = '/__dsh-version-check/check';
 const UPDATE_PATH = '/__dsh-version-check/update';
+const VERSIONS_PATH = '/__dsh-version-check/versions';
+const ROLLBACK_PATH = '/__dsh-version-check/rollback';
 const RESTART_PATH = '/__dsh-version-check/restart';
 const PREFERENCES_PATH = '/__dsh-version-check/preferences';
 const STYLESHEET_PATH = new URL('./styles/client.css', import.meta.url);
@@ -39,6 +48,7 @@ const RESTART_WATCHDOG_MS = 60 * 1000;
 const INSTALL_OUTPUT_LIMIT = 400;
 const INSTALL_ERROR_LIMIT = 300;
 const BODY_LIMIT = 16 * 1024;
+const VERSIONS_CACHE_MS = 5 * 60 * 1000;
 
 /** patch 层解析后的配置。 */
 interface ResolvedConfig {
@@ -434,6 +444,7 @@ export function apply(ctx: Context, config: unknown): void {
   let activeInstall: ChildProcess | null = null;
   let autoCheckTimer: NodeJS.Timeout | null = null;
   let autoCheckInterval: NodeJS.Timeout | null = null;
+  let publishedCache: { fetchedAt: number; versions: PublishedVersion[] } | null = null;
 
   const isBusy = (): boolean => state.phase === 'installing' || state.phase === 'restarting';
 
@@ -539,6 +550,19 @@ export function apply(ctx: Context, config: unknown): void {
     });
 
     return inflightCheck;
+  };
+
+  /**
+   * 读取 registry 的已发布版本列表，结果在进程内缓存 VERSIONS_CACHE_MS。
+   */
+  const loadPublishedVersions = async (): Promise<PublishedVersion[]> => {
+    if (publishedCache !== null && Date.now() - publishedCache.fetchedAt < VERSIONS_CACHE_MS) {
+      return publishedCache.versions;
+    }
+    const versions = await fetchPublishedVersions(patchDefaults.registry);
+    publishedCache = { fetchedAt: Date.now(), versions };
+
+    return versions;
   };
 
   /** 停止自动检查定时器。 */
@@ -836,6 +860,129 @@ export function apply(ctx: Context, config: unknown): void {
     startInstall(version);
   };
 
+  /** GET /__dsh-version-check/versions */
+  const handleVersionsRoute: RouteHandler = async (req, res) => {
+    // 只接受 GET
+    if (req.method !== 'GET') {
+      sendError(res, 405, 'E_METHOD', '该路由只接受 GET');
+      return;
+    }
+
+    // 来源校验
+    const refusal = gateRequest(req, patchDefaults.allowedOrigins);
+    if (refusal !== null) {
+      sendError(res, 403, 'E_FORBIDDEN', `请求来源校验失败: ${refusal}`);
+      return;
+    }
+
+    // 安装期间不读磁盘版本，避免读到正在替换的 package.json
+    if (!isBusy()) {
+      try {
+        refreshInstalledVersion();
+      } catch (error) {
+        sendError(res, 500, 'E_STATE', `无法读取 DSH 安装版本: ${describeError(error)}`);
+        return;
+      }
+    }
+    if (!ensureInstalledVersionParsable(res)) {
+      return;
+    }
+
+    // 查询已发布版本；失败按 registry 错误上报
+    let published: PublishedVersion[];
+    try {
+      published = await loadPublishedVersions();
+    } catch (error) {
+      sendError(res, 502, 'E_REGISTRY', describeError(error));
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      installedVersion: state.installedVersion,
+      versions: selectRollbackCandidates(published, state.installedVersion),
+    });
+  };
+
+  /** POST /__dsh-version-check/rollback */
+  const handleRollbackRoute: RouteHandler = async (req, res) => {
+    // 只接受 POST
+    if (req.method !== 'POST') {
+      sendError(res, 405, 'E_METHOD', '该路由只接受 POST');
+      return;
+    }
+
+    // 来源与 Content-Type 校验
+    const refusal = postRefusal(req, patchDefaults.allowedOrigins);
+    if (refusal !== null) {
+      sendError(res, 403, 'E_FORBIDDEN', refusal);
+      return;
+    }
+    if (!isJsonContentType(req)) {
+      sendError(res, 415, 'E_CONTENT_TYPE', 'Content-Type 必须是 application/json');
+      return;
+    }
+
+    // 请求体必须显式确认
+    const body = await readJsonBody(req, BODY_LIMIT);
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      sendError(res, 400, 'E_CONFIRM', '请求体必须是合法的 JSON 对象');
+      return;
+    }
+    const requestBody = body as Record<string, unknown>;
+    if (requestBody.confirm !== true) {
+      sendError(res, 400, 'E_CONFIRM', '回滚操作需要显式确认: {"confirm": true}');
+      return;
+    }
+
+    // 忙碌状态；回滚是修复操作，不受自动检查开关限制
+    if (isBusy()) {
+      sendError(res, 409, 'E_BUSY', '正在安装或重启，请稍后再试');
+      return;
+    }
+
+    // 读取磁盘版本
+    try {
+      refreshInstalledVersion();
+    } catch (error) {
+      sendError(res, 500, 'E_STATE', `无法读取 DSH 安装版本: ${describeError(error)}`);
+      return;
+    }
+    if (!isValidVersion(state.installedVersion)) {
+      sendError(res, 500, 'E_STATE', `磁盘上的 DSH 版本号无法解析: ${state.installedVersion}`);
+      return;
+    }
+
+    // 目标版本必须是 registry 上比当前版本更旧的已发布版本
+    const version = requestBody.version;
+    if (typeof version !== 'string' || !isValidVersion(version)) {
+      sendError(res, 409, 'E_NOT_AVAILABLE', '目标版本不是比当前版本更旧的已发布版本');
+      return;
+    }
+    let published: PublishedVersion[];
+    try {
+      published = await loadPublishedVersions();
+    } catch (error) {
+      sendError(res, 502, 'E_REGISTRY', describeError(error));
+      return;
+    }
+    const candidate = selectRollbackCandidates(published, state.installedVersion).some(
+      (entry) => entry.version === version,
+    );
+    if (!candidate) {
+      sendError(res, 409, 'E_NOT_AVAILABLE', '目标版本不是比当前版本更旧的已发布版本');
+      return;
+    }
+
+    // 先回 202，再启动安装
+    state.phase = 'installing';
+    state.target = version;
+    state.lastError = null;
+    state.installOutput = null;
+    sendJson(res, 202, snapshot());
+    startInstall(version);
+  };
+
   /** POST /__dsh-version-check/restart */
   const handleRestartRoute: RouteHandler = async (req, res) => {
     // 只接受 POST
@@ -982,11 +1129,13 @@ export function apply(ctx: Context, config: unknown): void {
       table.push({ kind: 'style', text: stylesheet });
     });
 
-    // 五个 loopback 路由
+    // 七个 loopback 路由
     const routes: Array<[string, RouteHandler]> = [
       [STATE_PATH, handleStateRoute],
       [CHECK_PATH, handleCheckRoute],
       [UPDATE_PATH, handleUpdateRoute],
+      [VERSIONS_PATH, handleVersionsRoute],
+      [ROLLBACK_PATH, handleRollbackRoute],
       [RESTART_PATH, handleRestartRoute],
       [PREFERENCES_PATH, handlePreferencesRoute],
     ];

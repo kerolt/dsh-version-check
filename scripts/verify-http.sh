@@ -2,7 +2,7 @@
 # 对已安装的 dsh-version-check Host 路由做真实的 HTTP 验证。
 # 用法：DVC_CURL_OPTS="-b /tmp/cookies.txt" bash scripts/verify-http.sh [base-url]
 # 默认 base-url http://127.0.0.1:3080；登录 cookie 通过 DVC_CURL_OPTS 传入。
-# 本脚本不会触发真实的更新或重启，只验证状态读取、检查更新与各种拒绝路径。
+# 本脚本不会触发真实的更新、回滚或重启，只验证状态读取、检查更新、回滚候选与各种拒绝路径。
 set -u
 
 BASE="${1:-http://127.0.0.1:3080}"
@@ -105,6 +105,71 @@ report "GET check 返回 405" 405 "$code" "$(body)"
 code=$(request -X POST -H 'content-type: application/json' -d '{"confirm":true,"version":"99.99.99"}' "$BASE/__dsh-version-check/update")
 report "update 不存在的版本返回 409" 409 "$code" "$(body)"
 
+# 回滚候选列表：读取成功时再验证依赖 registry 的拒绝路径
+code=$(request -X GET "$BASE/__dsh-version-check/versions")
+report "GET versions 返回 200" 200 "$code" "$(body)"
+VERSIONS_CODE=$code
+if [ "$VERSIONS_CODE" = "200" ]; then
+  cp "$BODY_FILE" /tmp/dvc-verify-versions.json
+  node - /tmp/dvc-verify-versions.json <<'NODE'
+const fs = require('node:fs');
+const payload = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const problems = [];
+const expect = (condition, message) => {
+  if (!condition) problems.push(message);
+};
+expect(payload.ok === true, 'ok 必须为 true');
+expect(typeof payload.installedVersion === 'string' && payload.installedVersion.length > 0, 'installedVersion 必须是非空字符串');
+expect(Array.isArray(payload.versions) && payload.versions.length > 0, 'versions 必须是非空数组');
+for (const entry of Array.isArray(payload.versions) ? payload.versions : []) {
+  expect(typeof entry.version === 'string' && entry.version.length > 0, 'versions 每一项必须有 version');
+  expect(entry.version !== payload.installedVersion, '候选版本不能等于当前安装版本');
+  expect(entry.publishedAt === null || typeof entry.publishedAt === 'string', 'publishedAt 必须是字符串或 null');
+}
+if (problems.length > 0) {
+  console.error('FAIL  versions 结构: ' + problems.join('; '));
+  process.exit(1);
+}
+console.log(`PASS  versions 结构  (installed=${payload.installedVersion}, 候选 ${payload.versions.length} 个, 最新候选=${payload.versions[0].version})`);
+NODE
+  if [ "$?" != "0" ]; then FAIL=1; fi
+else
+  echo "SKIP  依赖 registry 的 versions 断言（GET versions 返回 $VERSIONS_CODE）"
+fi
+
+code=$(request -X POST -H 'content-type: application/json' -d '{"confirm":false,"version":"0.0.1"}' "$BASE/__dsh-version-check/rollback")
+report "rollback 缺少 confirm 返回 400" 400 "$code" "$(body)"
+
+code=$(request -X POST -H 'content-type: application/json' -H 'Origin: http://evil.example' -d '{"confirm":true,"version":"0.0.1"}' "$BASE/__dsh-version-check/rollback")
+report "跨源 rollback 返回 403" 403 "$code" "$(body)"
+
+code=$(request -X POST -H 'content-type: text/plain' --data-binary '{"confirm":true,"version":"0.0.1"}' "$BASE/__dsh-version-check/rollback")
+report "rollback 错误 content-type 返回 415" 415 "$code" "$(body)"
+
+code=$(request -X GET -H 'Origin: http://evil.example' "$BASE/__dsh-version-check/versions")
+report "跨源 versions 返回 403" 403 "$code" "$(body)"
+
+code=$(request -X GET "$BASE/__dsh-version-check/rollback")
+report "GET rollback 返回 405" 405 "$code" "$(body)"
+
+code=$(request -X POST "$BASE/__dsh-version-check/versions")
+report "POST versions 返回 405" 405 "$code" "$(body)"
+
+if [ "$VERSIONS_CODE" = "200" ]; then
+  INSTALLED_VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/dvc-verify-state.json','utf8')).installedVersion)")
+  code=$(request -X POST -H 'content-type: application/json' -d '{"confirm":true,"version":"99.99.99"}' "$BASE/__dsh-version-check/rollback")
+  report "rollback 不存在的版本返回 409" 409 "$code" "$(body)"
+  case "$(body)" in
+    *E_NOT_AVAILABLE*) echo "PASS  rollback 拒绝原因为 E_NOT_AVAILABLE" ;;
+    *) echo "FAIL  rollback 拒绝原因不是 E_NOT_AVAILABLE: $(body)"; FAIL=1 ;;
+  esac
+
+  code=$(request -X POST -H 'content-type: application/json' -d "{\"confirm\":true,\"version\":\"$INSTALLED_VERSION\"}" "$BASE/__dsh-version-check/rollback")
+  report "rollback 当前版本返回 409" 409 "$code" "$(body)"
+else
+  echo "SKIP  依赖 registry 的回滚断言（GET versions 返回 $VERSIONS_CODE）"
+fi
+
 code=$(request -X POST -H 'content-type: application/json' -d '{"confirm":false}' "$BASE/__dsh-version-check/restart")
 report "restart 缺少 confirm 返回 400" 400 "$code" "$(body)"
 
@@ -168,6 +233,16 @@ case "$(body)" in
   *E_UPDATE_DISABLED*) echo "PASS  update 拒绝原因为 E_UPDATE_DISABLED" ;;
   *) echo "FAIL  update 拒绝原因不是 E_UPDATE_DISABLED: $(body)"; FAIL=1 ;;
 esac
+
+# 回滚是修复操作，不受自动检查开关限制；这里只验证它走到候选校验并拒绝不存在的版本
+if [ "$VERSIONS_CODE" = "200" ]; then
+  code=$(request -X POST -H 'content-type: application/json' -d '{"confirm":true,"version":"99.99.99"}' "$BASE/__dsh-version-check/rollback")
+  report "关闭后 rollback 仍走候选校验返回 409" 409 "$code" "$(body)"
+  case "$(body)" in
+    *E_NOT_AVAILABLE*) echo "PASS  关闭后 rollback 不受检查开关限制" ;;
+    *) echo "FAIL  关闭后 rollback 拒绝原因异常: $(body)"; FAIL=1 ;;
+  esac
+fi
 
 code=$(request -X POST -H 'content-type: application/json' -d '{"checkEnabled":true}' "$BASE/__dsh-version-check/preferences")
 report "preferences 恢复检查返回 200" 200 "$code" "$(body)"
