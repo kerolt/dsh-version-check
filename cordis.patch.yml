@@ -1,0 +1,23 @@
+# dsh-version-check 的 profile patch 层：插入一个 loader 条目，
+# Host 半由 lib/index.js 提供，浏览器半由 package.json 的 dsh.client 声明指向 lib/client.js。
+# 下面列出的 config 就是插件默认值，可以在 ~/.dsh/profiles/<profile>/cordis.patch.yml
+# 里用相同的 id 覆盖；整段 config 会被替换，未写的字段由插件内部默认值补齐。
+- insert:
+    - id: dsh-version-check
+      name: 'dsh-version-check'
+      config:
+        # npm registry 地址，末尾不要斜杠
+        registry: 'https://registry.npmjs.org'
+        # 是否检查更新；这里只是默认值，用户在设置页里的选择保存在
+        # $DSH_HOME/dsh-version-check/preferences.json，并覆盖这里的值
+        checkEnabled: true
+        # 自动检查间隔（分钟）
+        checkIntervalMinutes: 360
+        # 跟踪的渠道：auto 按当前版本的前置标识（rc/alpha 等）选择 dist-tag，
+        # 也可以直接写 dist-tag 名称，例如 latest 或 alpha
+        channel: auto
+        # 反向代理或隧道部署时，把浏览器实际访问的源写进来，
+        # 用于放宽请求来源校验；loopback 直连不需要
+        allowedOrigins: []
+        # npm 安装超时（秒）
+        restartTimeoutSeconds: 900
